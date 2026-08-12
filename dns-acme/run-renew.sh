@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# run-renew.sh - cron/Task-Scheduler friendly wrapper around `acme.sh --cron`
+#
+# Author: ungentilgarcon (assisted by GitHub Copilot / Copilot CLI)
+# Copyright (C) 2026 ungentilgarcon
+# License: GNU General Public License v3.0 or later (GPL-3.0-or-later)
+#   See the LICENSE file at the root of this repository, or
+#   <https://www.gnu.org/licenses/>.
+#
+# acme.sh already tracks each certificate's expiry and only actually renews
+# when needed (~30 days before expiry), so it is safe to invoke this script
+# as often as you like (daily is the usual recommendation). This wrapper
+# adds: a lockfile (avoid overlapping runs), logging to a file, an email
+# notification of the outcome (success/failure) to a configurable address,
+# and a non-zero exit code on failure so cron/Task Scheduler can flag it.
+#
+# Runs unmodified on plain Debian/Ubuntu bash (no WSL required) as well as
+# WSL or Git-Bash on Windows.
+#
+# USAGE
+#   ./run-renew.sh                       # renew all certs due for renewal
+#   ./run-renew.sh example.com           # force-renew one specific cert
+#
+# EMAIL NOTIFICATION
+#   Set NOTIFY_EMAIL (env var, or in orange.env) to the address that should
+#   receive a "SUCCESS"/"FAILURE" report after each run. The report includes
+#   the tail of the acme.sh log so you can diagnose failures without SSHing
+#   in. Sending uses, in order of preference:
+#     1. `sendemail`/`ssmtp`/`msmtp` if MAIL_TRANSPORT explicitly picks one
+#     2. the system `mail`/`mailx` command (Debian/Ubuntu: `apt install
+#        mailutils` or `bsd-mailx`, needs a working MTA e.g. `postfix` or
+#        `ssmtp` configured for relay/smarthost)
+#     3. `msmtp` if installed and configured (~/.msmtprc), good choice when
+#        you just want to relay via an external SMTP account (Gmail, etc.)
+#        without running a full MTA - `apt install msmtp msmtp-mta`
+#   If none of these are available/configured, the script logs a warning
+#   but does not fail the renewal because of it.
+#
+#   Additional SMTP-related env vars (only used by the msmtp fallback path
+#   when no ~/.msmtprc exists yet - see orange.env.example for a template):
+#     SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_FROM, SMTP_TLS
+#
+# SCHEDULING ON LINUX (Debian/Ubuntu, incl. inside WSL)
+#   crontab -e
+#   0 3 * * * /home/you/acme-scripts/run-renew.sh >> /home/you/acme-scripts/renew.log 2>&1
+#
+# SCHEDULING ON WINDOWS
+#   Option A - WSL cron (recommended if you already use WSL):
+#     1. In your WSL distro:  crontab -e
+#     2. Add:  0 3 * * * /home/you/acme-scripts/run-renew.sh >> /home/you/acme-scripts/renew.log 2>&1
+#
+#   Option B - Windows Task Scheduler calling into WSL:
+#     schtasks /Create /SC DAILY /ST 03:00 /TN "LetsEncryptRenew" ^
+#       /TR "wsl.exe -d Ubuntu -- /home/you/acme-scripts/run-renew.sh"
+#
+#   Option C - Git-Bash / Cygwin bash directly from Task Scheduler:
+#     schtasks /Create /SC DAILY /ST 03:00 /TN "LetsEncryptRenew" ^
+#       /TR "\"C:\Program Files\Git\bin\bash.exe\" -lc \"/c/Users/you/acme-scripts/run-renew.sh\""
+#
+# DEPLOYING THE RENEWED CERT (optional)
+#   Add a --deploy hook (or your own script) to run-renew.sh below, e.g.:
+#     acme.sh --deploy -d example.com --deploy-hook someservice
+#   or just `--install-cert` with --reloadcmd to copy files / restart IIS,
+#   nginx, HAProxy, etc. after each renewal.
+# ---------------------------------------------------------------------------
+set -u
+
+ACME_HOME="${ACME_HOME:-$HOME/.acme.sh}"
+ACME_BIN="$ACME_HOME/acme.sh"
+LOCKFILE="${TMPDIR:-/tmp}/acme-renew.lock"
+RUNLOG="$(mktemp)"
+NOTIFY_EMAIL="${NOTIFY_EMAIL:-}"
+NOTIFY_EMAIL_ON_SUCCESS="${NOTIFY_EMAIL_ON_SUCCESS:-1}" # set to 0 to only email on failure
+HOSTLABEL="$(hostname 2>/dev/null || echo unknown-host)"
+
+_log() {
+  echo "$@" | tee -a "$RUNLOG"
+}
+
+# Sends the final report by whichever mail transport is available.
+# Args: subject body
+_notify() {
+  subject=$1
+  body=$2
+
+  if [ -z "$NOTIFY_EMAIL" ]; then
+    _log "NOTIFY_EMAIL not set, skipping email notification."
+    return 0
+  fi
+
+  if command -v msmtp >/dev/null 2>&1 && [ -f "$HOME/.msmtprc" ]; then
+    {
+      echo "Subject: $subject"
+      echo "To: $NOTIFY_EMAIL"
+      echo
+      printf '%s\n' "$body"
+    } | msmtp --read-envelope-from -t "$NOTIFY_EMAIL" 2>>"$RUNLOG" && return 0
+    _log "msmtp send failed, trying next transport."
+  fi
+
+  if command -v mail >/dev/null 2>&1; then
+    printf '%s\n' "$body" | mail -s "$subject" "$NOTIFY_EMAIL" 2>>"$RUNLOG" && return 0
+    _log "mail/mailx send failed, trying next transport."
+  fi
+
+  if command -v sendmail >/dev/null 2>&1; then
+    {
+      echo "To: $NOTIFY_EMAIL"
+      echo "Subject: $subject"
+      echo "Content-Type: text/plain; charset=UTF-8"
+      echo
+      printf '%s\n' "$body"
+    } | sendmail -t 2>>"$RUNLOG" && return 0
+    _log "sendmail send failed."
+  fi
+
+  _log "WARNING: no working mail transport found (tried msmtp/mail/sendmail); notification NOT sent."
+  return 1
+}
+
+if [ ! -x "$ACME_BIN" ]; then
+  _log "acme.sh not found or not executable at $ACME_BIN"
+  _notify "[LetsEncrypt] FAILURE on $HOSTLABEL: acme.sh missing" \
+    "acme.sh was not found or not executable at $ACME_BIN. Nothing was renewed."
+  exit 1
+fi
+
+# Simple flock-based mutex; falls back to a pidfile check if flock is missing
+# (e.g. plain Git-Bash without util-linux).
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$LOCKFILE"
+  if ! flock -n 9; then
+    _log "Another renewal run is already in progress, exiting."
+    exit 0
+  fi
+else
+  if [ -f "$LOCKFILE" ] && kill -0 "$(cat "$LOCKFILE")" 2>/dev/null; then
+    _log "Another renewal run is already in progress, exiting."
+    exit 0
+  fi
+  echo $$ > "$LOCKFILE"
+  trap 'rm -f "$LOCKFILE"' EXIT
+fi
+
+_log "=== $(date -Is) starting renewal check on $HOSTLABEL ==="
+
+if [ $# -ge 1 ]; then
+  # Force-renew a specific domain, useful for testing or manual re-issue.
+  target="$1"
+  "$ACME_BIN" --renew -d "$target" --force >>"$RUNLOG" 2>&1
+  rc=$?
+else
+  target="(all due certificates)"
+  # Normal unattended path: acme.sh decides per-certificate if renewal is due.
+  "$ACME_BIN" --cron --home "$ACME_HOME" >>"$RUNLOG" 2>&1
+  rc=$?
+fi
+
+_log "=== $(date -Is) finished with exit code $rc ==="
+
+logtail="$(tail -n 60 "$RUNLOG")"
+if [ $rc -eq 0 ]; then
+  if [ "$NOTIFY_EMAIL_ON_SUCCESS" = "1" ]; then
+    _notify "[LetsEncrypt] SUCCESS on $HOSTLABEL: $target" \
+      "Renewal check completed successfully for $target on $HOSTLABEL at $(date -Is).
+
+--- last 60 lines of log ---
+$logtail"
+  fi
+else
+  _notify "[LetsEncrypt] FAILURE on $HOSTLABEL: $target (exit $rc)" \
+    "Renewal check FAILED for $target on $HOSTLABEL at $(date -Is), exit code $rc.
+
+--- last 60 lines of log ---
+$logtail"
+fi
+
+cat "$RUNLOG"
+rm -f "$RUNLOG"
+exit $rc

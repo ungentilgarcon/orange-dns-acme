@@ -1,0 +1,7 @@
+# Never commit real credentials
+orange.env
+*.env
+!*.env.example
+
+# acme.sh local state if ever run from inside this repo
+.acme.sh/
