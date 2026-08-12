@@ -211,6 +211,14 @@ Useful flags:
   exists (e.g. after changing which SANs a certificate should cover).
 * `--issue-only` - only do step 1 above, skip the `--cron` pass (handy if
   you run `run-renew.sh` separately for the renewal part).
+* `--dry-run` (or `-n`) - print the exact `acme.sh` command(s) that would
+  run for each step, without actually calling `acme.sh` or writing anything
+  to the Orange DNS API. Also skips the summary email. Great for validating
+  a `domains.conf` change before it touches anything.
+* `--readonly` - alias for `--dry-run`; also exported as `OA_READONLY=1` so
+  `dns_orange.sh` itself refuses any write call even if invoked directly.
+* `--verbose` (or `-v`) - stream each `acme.sh` command's output to stdout
+  live as it runs, in addition to the usual end-of-run log/email.
 
 Add it to cron/Task Scheduler the same way as `run-renew.sh` (see step 7),
 just pointing at `renew-multi.sh --config ~/acme-scripts/domains.conf`
@@ -233,6 +241,12 @@ mkdir -p ~/acme-scripts
 cp /path/to/dns-acme/run-renew.sh ~/acme-scripts/
 chmod +x ~/acme-scripts/run-renew.sh
 ```
+
+`run-renew.sh` supports the same kind of flags as `renew-multi.sh`:
+* `--dry-run` (`-n`) - print the `acme.sh` command that would run, without
+  calling it or writing anything to Orange DNS. Skips the email too.
+* `--readonly` - alias for `--dry-run`.
+* `--verbose` (`-v`) - stream the `acme.sh` output to stdout live as it runs.
 
 ### Native Debian/Ubuntu or WSL's own cron (simplest)
 
@@ -276,6 +290,23 @@ while you validate the DNS hook works:
 ~/.acme.sh/acme.sh --issue --test --dns dns_orange \
   -d example.com -d '*.example.com' --debug 2
 ```
+
+You can also validate `dns_orange.sh` itself without ever touching the
+Let's Encrypt API or your DNS records:
+
+```bash
+# 1. Dry-run the acme.sh hook (no writes to Orange DNS, still does GET
+#    lookups so you see exactly what it would have created/removed):
+OA_DRY_RUN=1 ~/.acme.sh/acme.sh --issue --dns dns_orange \
+  -d example.com --debug 2
+
+# 2. Or use the standalone read-only CLI mode, which just lists what's
+#    already in Orange DNS (never writes anything, no acme.sh needed):
+source ~/acme-scripts/orange.env
+~/acme-scripts/dns_orange.sh --list-zones
+~/acme-scripts/dns_orange.sh --list-records example.com
+```
+
 
 `--debug 2` prints the underlying DNS API calls/responses, useful the first
 time to confirm zone lookup and TXT record creation/removal are working

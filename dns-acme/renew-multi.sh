@@ -31,6 +31,9 @@
 #   ./renew-multi.sh --config domains.conf
 #   ./renew-multi.sh --config domains.conf --force      # force re-issue all
 #   ./renew-multi.sh --config domains.conf --issue-only # skip the --cron pass
+#   ./renew-multi.sh --config domains.conf --dry-run    # show plan, change nothing
+#   ./renew-multi.sh --config domains.conf --readonly   # alias for --dry-run
+#   ./renew-multi.sh --config domains.conf --verbose    # stream acme.sh output live
 #
 # CONFIG FILE FORMAT (see domains.conf.example)
 #   One certificate per line, first domain is the primary name, any further
@@ -70,13 +73,22 @@ HOSTLABEL="$(hostname 2>/dev/null || echo unknown-host)"
 CONFIG_FILE=""
 FORCE=0
 ISSUE_ONLY=0
+DRY_RUN=0
+READONLY=0
+VERBOSE=0
 
 usage() {
   cat >&2 <<'USAGE'
-Usage: renew-multi.sh --config <domains.conf> [--force] [--issue-only]
+Usage: renew-multi.sh --config <domains.conf> [--force] [--issue-only] [--dry-run] [--readonly] [--verbose]
   --config PATH   Path to the domain list (see domains.conf.example)
   --force         Pass --force to every --issue call (re-issues even if not due)
   --issue-only    Only run the per-line --issue pass; skip the final --cron pass
+  --dry-run, -n   Print what would run (which certs would be issued/renewed,
+                  the exact acme.sh command lines) without calling acme.sh or
+                  writing anything to the Orange DNS API. Skips notification.
+  --readonly      Alias for --dry-run.
+  --verbose, -v   Echo each acme.sh command before running it and stream its
+                  output to stdout as it happens (still also logged/emailed).
 USAGE
   exit 1
 }
@@ -95,6 +107,19 @@ while [ $# -gt 0 ]; do
       ISSUE_ONLY=1
       shift
       ;;
+    --dry-run|-n)
+      DRY_RUN=1
+      shift
+      ;;
+    --readonly)
+      DRY_RUN=1
+      READONLY=1
+      shift
+      ;;
+    --verbose|-v)
+      VERBOSE=1
+      shift
+      ;;
     -h|--help)
       usage
       ;;
@@ -108,6 +133,13 @@ done
 if [ -z "$CONFIG_FILE" ] || [ ! -f "$CONFIG_FILE" ]; then
   echo "Error: --config <file> is required and must point to an existing file." >&2
   usage
+fi
+
+if [ "$READONLY" = "1" ]; then
+  export OA_READONLY=1
+fi
+if [ "$DRY_RUN" = "1" ]; then
+  export OA_DRY_RUN=1
 fi
 
 if [ ! -x "$ACME_BIN" ]; then
@@ -134,11 +166,26 @@ else
 fi
 
 _log "=== $(date -Is) starting multi-domain renewal check on $HOSTLABEL ==="
-_log "Config: $CONFIG_FILE  force=$FORCE issue-only=$ISSUE_ONLY"
+_log "Config: $CONFIG_FILE  force=$FORCE issue-only=$ISSUE_ONLY dry-run=$DRY_RUN verbose=$VERBOSE"
 
 overall_rc=0
 declare -a results=()   # human-readable "domain: OK"/"domain: FAILED (rc=N)" lines
 declare -a failed=()    # just the failing primary domains, for the subject line
+
+# Runs "$@" honoring DRY_RUN/VERBOSE: dry-run only logs+prints the command,
+# verbose additionally streams output to stdout while still logging it.
+_run_step() {
+  if [ "$DRY_RUN" = "1" ]; then
+    _log "[DRY-RUN] would run: $*"
+    return 0
+  fi
+  if [ "$VERBOSE" = "1" ]; then
+    _log "+ $*"
+    "$@" 2>&1 | tee -a "$RUNLOG"
+    return "${PIPESTATUS[0]}"
+  fi
+  "$@" >>"$RUNLOG" 2>&1
+}
 
 # --- Pass 1: make sure every declared certificate exists (first --issue),
 #     or re-issue if --force was requested. ------------------------------
@@ -165,10 +212,10 @@ while IFS= read -r line || [ -n "$line" ]; do
     _log "--- issuing/re-issuing certificate for: $line ---"
     issue_args=(--issue --dns dns_orange "${args[@]}")
     [ "$FORCE" = "1" ] && issue_args+=(--force)
-    "$ACME_BIN" --home "$ACME_HOME" "${issue_args[@]}" >>"$RUNLOG" 2>&1
+    _run_step "$ACME_BIN" --home "$ACME_HOME" "${issue_args[@]}"
     rc=$?
     if [ $rc -eq 0 ]; then
-      results+=("$primary: OK (issued)")
+      results+=("$primary: OK ($([ "$DRY_RUN" = "1" ] && echo "would issue" || echo "issued"))")
     else
       results+=("$primary: FAILED (issue, rc=$rc)")
       failed+=("$primary")
@@ -183,10 +230,10 @@ done < "$CONFIG_FILE"
 #     already knows about (only actually renews certs due within ~30 days).
 if [ "$ISSUE_ONLY" != "1" ]; then
   _log "--- running acme.sh --cron for due renewals ---"
-  "$ACME_BIN" --cron --home "$ACME_HOME" >>"$RUNLOG" 2>&1
+  _run_step "$ACME_BIN" --cron --home "$ACME_HOME"
   cron_rc=$?
   if [ $cron_rc -eq 0 ]; then
-    results+=("(cron renewal pass): OK")
+    results+=("(cron renewal pass): OK$([ "$DRY_RUN" = "1" ] && echo " (dry-run)")")
   else
     results+=("(cron renewal pass): FAILED (rc=$cron_rc)")
     failed+=("cron-pass")
@@ -204,7 +251,9 @@ done
 
 logtail="$(tail -n 100 "$RUNLOG")"
 
-if [ $overall_rc -eq 0 ]; then
+if [ "$DRY_RUN" = "1" ]; then
+  _log "[DRY-RUN] skipping notification email."
+elif [ $overall_rc -eq 0 ]; then
   if [ "$NOTIFY_EMAIL_ON_SUCCESS" = "1" ]; then
     _notify "[LetsEncrypt] SUCCESS on $HOSTLABEL: all domains OK" \
       "Multi-domain renewal check completed successfully on $HOSTLABEL at $(date -Is).

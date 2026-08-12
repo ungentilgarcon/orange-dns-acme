@@ -21,6 +21,22 @@
 # USAGE
 #   ./run-renew.sh                       # renew all certs due for renewal
 #   ./run-renew.sh example.com           # force-renew one specific cert
+#   ./run-renew.sh --dry-run             # show what would run, change nothing
+#   ./run-renew.sh --verbose             # stream the acme.sh log live too
+#   ./run-renew.sh --readonly example.com  # alias for --dry-run (no writes)
+#
+# DRY-RUN / VERBOSE / READ-ONLY
+#   --dry-run / -n   Don't call acme.sh at all. Prints the exact acme.sh
+#                     command that would run, and (if OA_DNS_ENDPOINT env is
+#                     set up) exports OA_DRY_RUN=1 so that if you do end up
+#                     calling acme.sh yourself with --debug, dns_orange.sh
+#                     also won't write anything to the Orange DNS API.
+#   --readonly        Same effect as --dry-run - kept as a separate, more
+#                     explicit flag name for callers who want to make clear
+#                     no certificate/DNS state will be touched.
+#   --verbose / -v    Echo the acme.sh command line before running it, and
+#                     stream its output to stdout as it happens (in addition
+#                     to still being captured for the log tail/email).
 #
 # For issuing/renewing several distinct certificates (each possibly covering
 # multiple domains/SANs) from a single config file in one run, see
@@ -82,6 +98,57 @@ RUNLOG="$(mktemp)"
 NOTIFY_EMAIL_ON_SUCCESS="${NOTIFY_EMAIL_ON_SUCCESS:-1}" # set to 0 to only email on failure
 HOSTLABEL="$(hostname 2>/dev/null || echo unknown-host)"
 
+DRY_RUN=0
+VERBOSE=0
+READONLY=0
+target_args=()
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: run-renew.sh [--dry-run|-n] [--readonly] [--verbose|-v] [domain]
+  --dry-run, -n   Print what would run without calling acme.sh or writing
+                  anything to the Orange DNS API.
+  --readonly      Alias for --dry-run.
+  --verbose, -v   Stream the acme.sh log to stdout as it runs, in addition
+                  to the usual end-of-run summary/email.
+  domain          Optional: force-renew this one specific certificate
+                  instead of running the normal --cron pass.
+USAGE
+  exit 1
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run|-n)
+      DRY_RUN=1
+      shift
+      ;;
+    --readonly)
+      DRY_RUN=1
+      READONLY=1
+      shift
+      ;;
+    --verbose|-v)
+      VERBOSE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      ;;
+    *)
+      target_args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [ "$READONLY" = "1" ]; then
+  export OA_READONLY=1
+fi
+if [ "$DRY_RUN" = "1" ]; then
+  export OA_DRY_RUN=1
+fi
+
 
 if [ ! -x "$ACME_BIN" ]; then
   _log "acme.sh not found or not executable at $ACME_BIN"
@@ -108,23 +175,37 @@ else
 fi
 
 _log "=== $(date -Is) starting renewal check on $HOSTLABEL ==="
+[ "$DRY_RUN" = "1" ] && _log "*** DRY-RUN mode: no acme.sh command will actually be executed ***"
+[ "$VERBOSE" = "1" ] && _log "*** VERBOSE mode: streaming acme.sh output live ***"
 
-if [ $# -ge 1 ]; then
+if [ "${#target_args[@]}" -ge 1 ]; then
   # Force-renew a specific domain, useful for testing or manual re-issue.
-  target="$1"
-  "$ACME_BIN" --renew -d "$target" --force >>"$RUNLOG" 2>&1
-  rc=$?
+  target="${target_args[0]}"
+  cmd=("$ACME_BIN" --renew -d "$target" --force)
 else
   target="(all due certificates)"
   # Normal unattended path: acme.sh decides per-certificate if renewal is due.
-  "$ACME_BIN" --cron --home "$ACME_HOME" >>"$RUNLOG" 2>&1
+  cmd=("$ACME_BIN" --cron --home "$ACME_HOME")
+fi
+
+if [ "$DRY_RUN" = "1" ]; then
+  _log "[DRY-RUN] would run: ${cmd[*]}"
+  rc=0
+elif [ "$VERBOSE" = "1" ]; then
+  _log "+ ${cmd[*]}"
+  "${cmd[@]}" 2>&1 | tee -a "$RUNLOG"
+  rc=${PIPESTATUS[0]}
+else
+  "${cmd[@]}" >>"$RUNLOG" 2>&1
   rc=$?
 fi
 
 _log "=== $(date -Is) finished with exit code $rc ==="
 
 logtail="$(tail -n 60 "$RUNLOG")"
-if [ $rc -eq 0 ]; then
+if [ "$DRY_RUN" = "1" ]; then
+  _log "[DRY-RUN] skipping notification email."
+elif [ $rc -eq 0 ]; then
   if [ "$NOTIFY_EMAIL_ON_SUCCESS" = "1" ]; then
     _notify "[LetsEncrypt] SUCCESS on $HOSTLABEL: $target" \
       "Renewal check completed successfully for $target on $HOSTLABEL at $(date -Is).
