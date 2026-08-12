@@ -1,0 +1,28 @@
+# domains.conf.example
+# Author: ungentilgarcon (assisted by GitHub Copilot / Copilot CLI)
+# License: GPL-3.0-or-later - see LICENSE at the repository root
+#
+# One certificate per line. The first domain on a line is the certificate's
+# primary name (what acme.sh stores it under, e.g. ~/.acme.sh/<primary>/);
+# any further domains on the same line become additional SANs on that same
+# certificate. Blank lines and lines starting with # are ignored.
+#
+# Copy this file to e.g. ~/acme-scripts/domains.conf and edit it, then run:
+#   ./renew-multi.sh --config ~/acme-scripts/domains.conf
+#
+# Examples:
+
+# Single domain, no SAN:
+example.com
+
+# Domain + apex/www SAN pair:
+example2.com www.example2.com
+
+# Wildcard + apex in the same certificate (needs DNS-01, which is what
+# dns_orange.sh provides):
+example3.com *.example3.com
+
+# A completely unrelated domain can be on the same line too - acme.sh
+# doesn't require SANs to share a parent zone, and dns_orange.sh looks up
+# the correct Orange DNS hosted zone independently for each name:
+example4.com www.example4.com *.example4.com

@@ -22,6 +22,11 @@
 #   ./run-renew.sh                       # renew all certs due for renewal
 #   ./run-renew.sh example.com           # force-renew one specific cert
 #
+# For issuing/renewing several distinct certificates (each possibly covering
+# multiple domains/SANs) from a single config file in one run, see
+# renew-multi.sh in this same folder instead - it drives dns_orange.sh the
+# same way but loops over a domains.conf list and emails a combined report.
+#
 # EMAIL NOTIFICATION
 #   Set NOTIFY_EMAIL (env var, or in orange.env) to the address that should
 #   receive a "SUCCESS"/"FAILURE" report after each run. The report includes
@@ -66,58 +71,17 @@
 # ---------------------------------------------------------------------------
 set -u
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/notify.sh
+. "$SCRIPT_DIR/lib/notify.sh"
+
 ACME_HOME="${ACME_HOME:-$HOME/.acme.sh}"
 ACME_BIN="$ACME_HOME/acme.sh"
 LOCKFILE="${TMPDIR:-/tmp}/acme-renew.lock"
 RUNLOG="$(mktemp)"
-NOTIFY_EMAIL="${NOTIFY_EMAIL:-}"
 NOTIFY_EMAIL_ON_SUCCESS="${NOTIFY_EMAIL_ON_SUCCESS:-1}" # set to 0 to only email on failure
 HOSTLABEL="$(hostname 2>/dev/null || echo unknown-host)"
 
-_log() {
-  echo "$@" | tee -a "$RUNLOG"
-}
-
-# Sends the final report by whichever mail transport is available.
-# Args: subject body
-_notify() {
-  subject=$1
-  body=$2
-
-  if [ -z "$NOTIFY_EMAIL" ]; then
-    _log "NOTIFY_EMAIL not set, skipping email notification."
-    return 0
-  fi
-
-  if command -v msmtp >/dev/null 2>&1 && [ -f "$HOME/.msmtprc" ]; then
-    {
-      echo "Subject: $subject"
-      echo "To: $NOTIFY_EMAIL"
-      echo
-      printf '%s\n' "$body"
-    } | msmtp --read-envelope-from -t "$NOTIFY_EMAIL" 2>>"$RUNLOG" && return 0
-    _log "msmtp send failed, trying next transport."
-  fi
-
-  if command -v mail >/dev/null 2>&1; then
-    printf '%s\n' "$body" | mail -s "$subject" "$NOTIFY_EMAIL" 2>>"$RUNLOG" && return 0
-    _log "mail/mailx send failed, trying next transport."
-  fi
-
-  if command -v sendmail >/dev/null 2>&1; then
-    {
-      echo "To: $NOTIFY_EMAIL"
-      echo "Subject: $subject"
-      echo "Content-Type: text/plain; charset=UTF-8"
-      echo
-      printf '%s\n' "$body"
-    } | sendmail -t 2>>"$RUNLOG" && return 0
-    _log "sendmail send failed."
-  fi
-
-  _log "WARNING: no working mail transport found (tried msmtp/mail/sendmail); notification NOT sent."
-  return 1
-}
 
 if [ ! -x "$ACME_BIN" ]; then
   _log "acme.sh not found or not executable at $ACME_BIN"

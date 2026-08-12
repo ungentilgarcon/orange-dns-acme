@@ -27,9 +27,17 @@ requesting the cert to be the one serving traffic.
   the same Huawei-Cloud/OpenStack-Designate-style API OTC/Orange exposes).
 * [run-renew.sh](/dns-acme/run-renew.sh) is a thin wrapper around
   `acme.sh --cron` meant to be triggered daily by cron/Task Scheduler. It
-  adds a lockfile, logging, and an **email notification (success/failure)**
-  to a configurable address; acme.sh itself decides whether a renewal is
-  actually due (~30 days before expiry).
+  renews **every** certificate acme.sh already manages (so it already scales
+  to as many domains as you've issued), and adds a lockfile, logging, and an
+  **email notification (success/failure)** to a configurable address.
+* [renew-multi.sh](/dns-acme/renew-multi.sh) is for **declaring and (re-)
+  issuing many certificates/domains at once** from a single config file
+  ([domains.conf.example](/dns-acme/domains.conf.example)), instead of
+  typing out `acme.sh --issue ...` by hand for each one. It issues any
+  certificate in the list that doesn't exist yet, then runs the same
+  `--cron` renewal pass, and emails **one combined per-domain report**.
+* [lib/notify.sh](/dns-acme/lib/notify.sh) holds the logging/email-sending
+  code shared by run-renew.sh and renew-multi.sh.
 * [orange.env.example](/dns-acme/orange.env.example) is a template for the
   Orange IAM credentials and email/SMTP settings the scripts need.
 
@@ -156,7 +164,59 @@ Alternatively, if you already run a full MTA (postfix) or have `mailutils`/
 `bsd-mailx` installed and configured to relay through a smarthost, no extra
 setup is needed - `run-renew.sh` will use the system `mail` command.
 
-## 6. Schedule unattended renewal
+## 6. Managing multiple domains/certificates at once
+
+If you only ever need one certificate, `run-renew.sh` (step 7 below) is all
+you need - `acme.sh --cron` already renews every certificate it knows about,
+however many that is. [renew-multi.sh](/dns-acme/renew-multi.sh) is for the
+common case of wanting a **single place to declare every domain you manage**
+and a **single combined report** instead of juggling separate `acme.sh
+--issue` invocations and separate emails per certificate.
+
+```bash
+cp /path/to/dns-acme/domains.conf.example ~/acme-scripts/domains.conf
+cp /path/to/dns-acme/renew-multi.sh ~/acme-scripts/
+cp -r /path/to/dns-acme/lib ~/acme-scripts/
+chmod +x ~/acme-scripts/renew-multi.sh
+```
+
+Edit `~/acme-scripts/domains.conf`, one certificate per line, first domain
+is the primary name, further space-separated domains on the same line
+become SANs on that same certificate:
+
+```
+example.com
+example2.com www.example2.com
+example3.com *.example3.com
+```
+
+Then run it (after sourcing your `orange.env`):
+
+```bash
+source ~/acme-scripts/orange.env
+~/acme-scripts/renew-multi.sh --config ~/acme-scripts/domains.conf
+```
+
+What it does, in order:
+1. For every line whose certificate acme.sh doesn't already have on disk, it
+   runs `acme.sh --issue --dns dns_orange -d <domain> [-d <SAN> ...]`.
+2. Then it runs `acme.sh --cron` once, which lets acme.sh renew whichever of
+   *all* its known certificates (including ones issued outside this file)
+   are actually due.
+3. It emails `NOTIFY_EMAIL` a single report listing the outcome (OK/FAILED)
+   for each domain line plus the cron pass, with the log tail attached.
+
+Useful flags:
+* `--force` - re-issue every certificate in the list even if it already
+  exists (e.g. after changing which SANs a certificate should cover).
+* `--issue-only` - only do step 1 above, skip the `--cron` pass (handy if
+  you run `run-renew.sh` separately for the renewal part).
+
+Add it to cron/Task Scheduler the same way as `run-renew.sh` (see step 7),
+just pointing at `renew-multi.sh --config ~/acme-scripts/domains.conf`
+instead.
+
+## 7. Schedule unattended renewal
 
 `acme.sh --issue` already installs its own cron job inside the environment
 it ran in (a native Debian/Ubuntu crontab, WSL's own crontab, or Git-Bash's
@@ -164,7 +224,9 @@ if you use cronie there). That alone is often enough. This repo's
 [run-renew.sh](/dns-acme/run-renew.sh) wrapper adds locking, logging, and
 the email notification described above, and is also handy if you want
 Windows Task Scheduler to be the trigger instead (e.g. because your WSL
-distro/cron doesn't stay running).
+distro/cron doesn't stay running). If you manage several domains from one
+config file, use [renew-multi.sh](/dns-acme/renew-multi.sh) from step 6
+instead/in addition.
 
 ```bash
 mkdir -p ~/acme-scripts
@@ -205,7 +267,7 @@ schtasks /Create /SC DAILY /ST 03:00 /TN "LetsEncryptRenew" `
   /TR "\"C:\Program Files\Git\bin\bash.exe\" -lc \"~/acme-scripts/run-renew.sh\""
 ```
 
-## 7. Test the whole loop safely
+## 8. Test the whole loop safely
 
 Use Let's Encrypt's **staging** environment first to avoid rate limits
 while you validate the DNS hook works:
@@ -219,7 +281,7 @@ while you validate the DNS hook works:
 time to confirm zone lookup and TXT record creation/removal are working
 correctly. Once it succeeds end-to-end, re-run without `--test` (you may
 need `--force` to bypass the "already issued" skip) to get a real
-certificate, then rely on the cron schedule from step 6 for renewals (you
+certificate, then rely on the cron schedule from step 7 for renewals (you
 should receive a SUCCESS email confirming it).
 
 ## Troubleshooting
